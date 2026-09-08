@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
@@ -19,7 +21,8 @@
     "scenario:fallback": "tsx scripts/scenario-fallback.ts",
     "scenario:out-of-stock": "tsx scripts/scenario-out-of-stock.ts",
     "reconcile": "tsx scripts/reconcile.ts",
-    "catalog:explain": "tsx scripts/explain-catalog.ts"
+    "catalog:explain": "tsx scripts/explain-catalog.ts",
+    "scenario:stage2": "tsx scripts/scenario-stage2.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",

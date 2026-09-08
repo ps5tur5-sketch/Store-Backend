@@ -1,4 +1,5 @@
 import type { PoolClient } from 'pg';
+import { createHash } from 'node:crypto';
 import { transaction } from '../db.js';
 import type { OrderRow, PaymentEventInput } from '../types.js';
 
@@ -41,22 +42,23 @@ async function postLedgerTransition(
   const cashAmount = kind === 'payment_received' ? amount : -amount;
   await client.query(
     `INSERT INTO ledger_entries (transaction_id, account, amount, currency)
-     VALUES ($1, 'cash', $2, $4), ($1, 'customer_clearing', $3, $4)`,
-    [transactionId, cashAmount, -cashAmount, order.currency],
+     VALUES ($1, $5, $2, $4), ($1, 'customer_clearing', $3, $4)`,
+    [
+      transactionId,
+      cashAmount,
+      -cashAmount,
+      order.currency,
+      order.funding_source === 'wallet' ? 'wallet' : 'cash',
+    ],
   );
 }
 
 export async function scheduleDelivery(client: PoolClient, orderId: string): Promise<void> {
   const requestId = `req_${orderId}_1`;
   await client.query(
-    `INSERT INTO delivery_jobs (order_id, request_id)
-     VALUES ($1, $2)
-     ON CONFLICT (order_id) DO UPDATE SET
-       state = CASE WHEN delivery_jobs.state = 'completed' THEN 'completed' ELSE 'pending' END,
-       next_attempt_at = CASE WHEN delivery_jobs.state = 'completed' THEN delivery_jobs.next_attempt_at ELSE now() END,
-       locked_until = CASE WHEN delivery_jobs.state = 'completed' THEN delivery_jobs.locked_until ELSE NULL END,
-       last_error = CASE WHEN delivery_jobs.state = 'completed' THEN delivery_jobs.last_error ELSE NULL END,
-       updated_at = now()`,
+    `INSERT INTO delivery_jobs (order_id, request_id, provider)
+     SELECT id, $2, COALESCE(assigned_provider, 'A') FROM orders WHERE id=$1
+     ON CONFLICT (order_id) DO NOTHING`,
     [orderId, requestId],
   );
 }
@@ -83,17 +85,26 @@ export async function applyPaymentEvent(
     await client.query(
       `INSERT INTO audit_events (idempotency_key, event_type, order_id, payload)
        VALUES ($1, 'payment_rejected', $2, $3::jsonb) ON CONFLICT DO NOTHING`,
-      [`payment:${event.event_id}:rejected`, order.id, JSON.stringify({
-        eventId: event.event_id,
-        expectedAmount: Number(order.amount),
-        receivedAmount: Number(event.amount),
-        expectedCurrency: order.currency,
-        receivedCurrency: event.currency,
-      })],
+      [
+        `payment:${event.event_id}:rejected`,
+        order.id,
+        JSON.stringify({
+          eventId: event.event_id,
+          expectedAmount: Number(order.amount),
+          receivedAmount: Number(event.amount),
+          expectedCurrency: order.currency,
+          receivedCurrency: event.currency,
+        }),
+      ],
     );
     return { outcome: 'rejected_amount_or_currency_mismatch', order };
   }
 
+  // 'failed' is an unsuccessful payment attempt, not a refund authorization.
+  if (order.payment_state === 'paid' && event.status === 'failed') {
+    await markEvent(client, event.event_id, 'ignored_after_capture');
+    return { outcome: 'ignored_after_capture', order };
+  }
   const previousPaymentState = order.payment_state;
   let nextStatus = order.status;
   if (event.status === 'paid') {
@@ -117,7 +128,7 @@ export async function applyPaymentEvent(
     await postLedgerTransition(client, updatedOrder, event, 'payment_reversed');
   }
 
-  if (event.status === 'paid' && updatedOrder.status !== 'delivered') {
+  if (event.status === 'paid' && !['delivered', 'refunded'].includes(updatedOrder.status)) {
     await scheduleDelivery(client, updatedOrder.id);
   }
 
@@ -125,12 +136,16 @@ export async function applyPaymentEvent(
   await client.query(
     `INSERT INTO audit_events (idempotency_key, event_type, order_id, payload)
      VALUES ($1, 'payment_applied', $2, $3::jsonb) ON CONFLICT DO NOTHING`,
-    [`payment:${event.event_id}:applied`, order.id, JSON.stringify({
-      eventId: event.event_id,
-      status: event.status,
-      previousPaymentState,
-      nextStatus,
-    })],
+    [
+      `payment:${event.event_id}:applied`,
+      order.id,
+      JSON.stringify({
+        eventId: event.event_id,
+        status: event.status,
+        previousPaymentState,
+        nextStatus,
+      }),
+    ],
   );
   return { outcome: 'applied', order: updatedOrder };
 }
@@ -152,26 +167,44 @@ export async function handlePaymentWebhook(
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
        ON CONFLICT (event_id) DO NOTHING
        RETURNING *`,
-      [input.event_id, input.order_id, input.status, input.amount, input.currency, input.created_at, JSON.stringify(input)],
+      [
+        input.event_id,
+        input.order_id,
+        input.status,
+        input.amount,
+        input.currency,
+        input.created_at,
+        JSON.stringify(input),
+      ],
     );
 
     if (!inserted.rowCount) {
-      const existingResult = await client.query<PaymentEventRow>('SELECT * FROM payment_events WHERE event_id = $1', [input.event_id]);
+      const existingResult = await client.query<PaymentEventRow>(
+        'SELECT * FROM payment_events WHERE event_id = $1',
+        [input.event_id],
+      );
       const existing = existingResult.rows[0];
       if (!existing) throw new Error(`Payment event ${input.event_id} conflict without an existing row`);
-      const samePayload = existing.order_id === input.order_id
-        && existing.status === input.status
-        && Number(existing.amount) === input.amount
-        && existing.currency === input.currency
-        && existing.event_created_at.getTime() === new Date(input.created_at).getTime();
+      const samePayload =
+        existing.order_id === input.order_id &&
+        existing.status === input.status &&
+        Number(existing.amount) === input.amount &&
+        existing.currency === input.currency &&
+        existing.event_created_at.getTime() === new Date(input.created_at).getTime();
       if (!samePayload) return { duplicate: true, outcome: 'event_id_payload_conflict' };
       return { duplicate: true, outcome: existing.processing_result ?? 'awaiting_order' };
     }
 
     const event = inserted.rows[0];
     if (!event) throw new Error('Inserted payment event was not returned');
+    const group = await client.query('SELECT 1 FROM order_groups WHERE id=$1', [input.order_id]);
+    if (group.rowCount) return { duplicate: false, outcome: await applyGroupPayment(client, event) };
     const order = await lockOrder(client, input.order_id);
     if (!order) return { duplicate: false, outcome: 'awaiting_order' };
+    if (order.group_id) {
+      await markEvent(client, event.event_id, 'rejected_use_group_payment');
+      return { duplicate: false, outcome: 'rejected_use_group_payment' };
+    }
     const applied = await applyPaymentEvent(client, order, event);
     return { duplicate: false, outcome: applied.outcome };
   });
@@ -196,8 +229,9 @@ export async function processPendingPaymentEvents(limit = 100): Promise<number> 
   const candidates = await transaction(async (client) => {
     const result = await client.query<{ order_id: string }>(
       `SELECT DISTINCT pe.order_id FROM payment_events pe
-       JOIN orders o ON o.id = pe.order_id
-       WHERE pe.processed_at IS NULL
+       LEFT JOIN orders o ON o.id = pe.order_id
+       LEFT JOIN order_groups g ON g.id = pe.order_id
+       WHERE pe.processed_at IS NULL AND (o.id IS NOT NULL OR g.id IS NOT NULL)
        ORDER BY pe.order_id LIMIT $1`,
       [limit],
     );
@@ -206,8 +240,71 @@ export async function processPendingPaymentEvents(limit = 100): Promise<number> 
   for (const candidate of candidates) {
     await transaction(async (client) => {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [candidate.order_id]);
-      await applyPendingEventsForOrder(client, candidate.order_id);
+      const group = await client.query('SELECT 1 FROM order_groups WHERE id=$1', [candidate.order_id]);
+      if (group.rowCount) await applyPendingGroupEvents(client, candidate.order_id);
+      else await applyPendingEventsForOrder(client, candidate.order_id);
     });
   }
   return candidates.length;
+}
+
+export async function applyGroupPayment(client: PoolClient, event: PaymentEventRow): Promise<string> {
+  const group = (await client.query('SELECT * FROM order_groups WHERE id=$1', [event.order_id])).rows[0];
+  if (Number(group.amount) !== Number(event.amount) || group.currency !== event.currency) {
+    await markEvent(client, event.event_id, 'rejected_amount_or_currency_mismatch');
+    return 'rejected_amount_or_currency_mismatch';
+  }
+  if (
+    group.user_id &&
+    (event.payload as unknown as Record<string, unknown>).source !== 'payment_simulator' &&
+    !String((event.payload as unknown as Record<string, unknown>).source ?? '').startsWith('cart_')
+  ) {
+    await markEvent(client, event.event_id, 'rejected_owned_checkout');
+    return 'rejected_owned_checkout';
+  }
+  const orders = await client.query<OrderRow>(
+    'SELECT * FROM orders WHERE group_id=$1 ORDER BY id FOR UPDATE',
+    [event.order_id],
+  );
+  const outcomes: string[] = [];
+  for (const order of orders.rows) {
+    const eventId =
+      'evt_item_' +
+      createHash('sha256')
+        .update(event.event_id + ':' + order.id)
+        .digest('hex');
+    const inserted = await client.query<PaymentEventRow>(
+      `INSERT INTO payment_events
+      (event_id,order_id,status,amount,currency,event_created_at,payload)
+      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [
+        eventId,
+        order.id,
+        event.status,
+        order.amount,
+        order.currency,
+        event.event_created_at,
+        JSON.stringify({
+          ...event.payload,
+          event_id: eventId,
+          order_id: order.id,
+          amount: Number(order.amount),
+          group_id: event.order_id,
+        }),
+      ],
+    );
+    outcomes.push((await applyPaymentEvent(client, order, inserted.rows[0]!)).outcome);
+  }
+  const outcome = outcomes.every((o) => o === outcomes[0]) ? outcomes[0]! : 'applied';
+  await markEvent(client, event.event_id, outcome);
+  return outcome;
+}
+
+export async function applyPendingGroupEvents(client: PoolClient, groupId: string) {
+  const events = await client.query<PaymentEventRow>(
+    `SELECT * FROM payment_events WHERE order_id=$1
+    AND processed_at IS NULL ORDER BY event_created_at,event_id`,
+    [groupId],
+  );
+  for (const event of events.rows) await applyGroupPayment(client, event);
 }

@@ -5,10 +5,11 @@ export type OrderStatus =
   | 'delivered'
   | 'payment_failed'
   | 'out_of_stock'
-  | 'delivery_failed';
+  | 'delivery_failed'
+  | 'refunded';
 
 export type PaymentState = 'pending' | 'paid' | 'failed';
-export type Provider = 'A' | 'B';
+export type Provider = string;
 
 export interface OrderRow {
   id: string;
@@ -23,6 +24,13 @@ export interface OrderRow {
   created_at: Date;
   updated_at: Date;
   delivered_at: Date | null;
+  refund_requested: boolean;
+  funding_source: 'wallet' | 'sbp' | 'crypto' | 'payment_stub';
+  group_id: string | null;
+  assigned_provider: Provider | null;
+  assigned_offer_id: string | null;
+  offer_name: string | null;
+  user_id: string | null;
 }
 
 export interface PaymentEventInput {
