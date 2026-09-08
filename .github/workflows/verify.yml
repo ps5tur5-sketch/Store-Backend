@@ -1,0 +1,20 @@
+name: Backend verification
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run acceptance tests in isolated PostgreSQL
+        run: docker compose --profile test run --rm --build tests
+      - name: Build production backend image
+        run: docker compose build backend
+      - name: Clean CI containers
+        if: always()
+        run: docker compose --profile test down -v
