@@ -16,7 +16,9 @@ export function getPool(): pg.Pool {
       idleTimeoutMillis: 30_000,
       application_name: 'game-goods-core',
     });
-    sharedPool.on('error', (error) => console.error(JSON.stringify({ level: 'error', event: 'postgres_pool_error', error: error.message })));
+    sharedPool.on('error', (error) =>
+      console.error(JSON.stringify({ level: 'error', event: 'postgres_pool_error', error: error.message })),
+    );
   }
   return sharedPool;
 }
@@ -34,6 +36,12 @@ export async function transaction<T>(fn: (client: PoolClient) => Promise<T>): Pr
     await client.query('BEGIN');
     const result = await fn(client);
     await client.query('COMMIT');
+    // The timestamp is available only after commit. Recovery archives any missed rows.
+    try {
+      await client.query('SELECT archive_business_commits()');
+    } catch (error) {
+      console.error('Commit timestamp archival deferred', (error as Error).message);
+    }
     return result;
   } catch (error) {
     await client.query('ROLLBACK');

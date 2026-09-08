@@ -1,3 +1,4 @@
+import { seedDemoMarketplace } from './demo-marketplace.js';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { closePool, getPool } from './db.js';
@@ -8,6 +9,7 @@ import { migrate } from '../scripts/migrate.js';
 const config = loadConfig();
 await migrate();
 await seedDatabase(getPool());
+if (config.DEMO_MARKETPLACE) await seedDemoMarketplace();
 
 const app = buildApp(config);
 await app.listen({ host: config.HOST, port: config.PORT });

@@ -1,0 +1,43 @@
+{
+  "checked_at": "2026-09-08T18:31:21.707Z",
+  "after_backend_restart": true,
+  "source_quantity": 1000,
+  "order": "chk_7b03cc909e5d4ed380df93faef307201",
+  "lots": [
+    {
+      "offer_id": "lot_387a3be2e977409c8fe647a9d6280dad",
+      "name": "Партия 1",
+      "price": 100,
+      "available": 199,
+      "sold": 1
+    },
+    {
+      "offer_id": "lot_6bfd4a6b09c94c72aebe129426324277",
+      "name": "Партия 2",
+      "price": 150,
+      "available": 399,
+      "sold": 1
+    },
+    {
+      "offer_id": "lot_bc6546758fab46baa65748913797f95e",
+      "name": "Партия 3",
+      "price": 200,
+      "available": 399,
+      "sold": 1
+    }
+  ],
+  "summary": {
+    "paid": 450,
+    "sales": 450,
+    "orders": 3,
+    "profit": 330,
+    "pending": 0,
+    "refunds": 0,
+    "refunded": 0,
+    "commission": 0,
+    "known_cost": 120,
+    "net_income": 450,
+    "paid_orders": 3,
+    "unknown_cost_count": 0
+  }
+}

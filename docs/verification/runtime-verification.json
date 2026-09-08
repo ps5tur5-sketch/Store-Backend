@@ -1,0 +1,86 @@
+{
+  "checked_at": "2026-09-08T18:32:37.922Z",
+  "proof_seller": {
+    "id": "DEMO_CHECK",
+    "flag": "red",
+    "confirmed_incidents": 2,
+    "verified_order": "proof_57982943-a5a0-43c2-af2f-91f4a02f36e8"
+  },
+  "inventory": {
+    "available": 7211,
+    "sellers": 6,
+    "rows": 72
+  },
+  "reconciliation": {
+    "wallet": {
+      "balances": 193521,
+      "ledger_balance": 193521,
+      "balanced": true
+    },
+    "withdrawals": {
+      "reserved": 0,
+      "ledger_reserved": 0,
+      "balanced": true
+    },
+    "paid_not_delivered": [],
+    "ledger_imbalances": [],
+    "invalid_deliveries": [],
+    "delivered_not_paid": [],
+    "settled_positions": 92
+  },
+  "money_report": {
+    "from": "2000-01-01T00:00:00Z",
+    "to": "2026-09-08T18:32:38.849Z",
+    "interval": "[from,to)",
+    "accounts": [
+      {
+        "currency": "RUB",
+        "account": "cash",
+        "opening": 0,
+        "movement": 76251,
+        "closing": 76251,
+        "history_precision": "legacy_reconstructed"
+      },
+      {
+        "currency": "RUB",
+        "account": "customer_clearing",
+        "opening": 0,
+        "movement": 0,
+        "closing": 0,
+        "history_precision": "legacy_reconstructed"
+      },
+      {
+        "currency": "RUB",
+        "account": "demo_funding",
+        "opening": 0,
+        "movement": 172730,
+        "closing": 172730,
+        "history_precision": "commit_time"
+      },
+      {
+        "currency": "RUB",
+        "account": "sales",
+        "opening": 0,
+        "movement": -55460,
+        "closing": -55460,
+        "history_precision": "legacy_reconstructed"
+      },
+      {
+        "currency": "RUB",
+        "account": "wallet",
+        "opening": 0,
+        "movement": -193521,
+        "closing": -193521,
+        "history_precision": "legacy_reconstructed"
+      },
+      {
+        "currency": "RUB",
+        "account": "withdrawal_clearing",
+        "opening": 0,
+        "movement": 0,
+        "closing": 0,
+        "history_precision": "commit_time"
+      }
+    ]
+  }
+}

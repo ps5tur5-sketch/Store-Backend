@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:17-alpine
+    command: ["postgres", "-c", "track_commit_timestamp=on"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-hr}
       POSTGRES_USER: ${POSTGRES_USER:-hr}
@@ -22,12 +23,17 @@ services:
       network: host
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-hr}:${POSTGRES_PASSWORD:-hr}@postgres:5432/${POSTGRES_DB:-hr}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin_demo}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-AdminDemo2026!}
+      SELLER_PASSWORD: ${SELLER_PASSWORD:-SellerDemo2026!}
+      DEMO_MARKETPLACE: ${DEMO_MARKETPLACE:-true}
       HOST: 0.0.0.0
       PORT: 3000
       LOG_LEVEL: ${LOG_LEVEL:-info}
       WORKER_ENABLED: ${WORKER_ENABLED:-true}
       WORKER_POLL_MS: ${WORKER_POLL_MS:-200}
       RECOVERY_POLL_MS: ${RECOVERY_POLL_MS:-5000}
+      SUPPLIER_SHARED_SECRET: ${SUPPLIER_SHARED_SECRET:-LocalSupplierDemo2026!}
       SUPPLIER_BASE_URL: http://backend:3000
       SUPPLIER_TIMEOUT_MS: ${SUPPLIER_TIMEOUT_MS:-300}
       SUPPLIER_MAX_ATTEMPTS: ${SUPPLIER_MAX_ATTEMPTS:-3}
@@ -47,6 +53,7 @@ services:
 
   postgres-test:
     image: postgres:17-alpine
+    command: ["postgres", "-c", "track_commit_timestamp=on"]
     profiles: ["test"]
     environment:
       POSTGRES_DB: hr

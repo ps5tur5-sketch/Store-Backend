@@ -1,13 +1,21 @@
 import { randomUUID } from 'node:crypto';
-import type { PoolClient } from 'pg';
 import { getPool, transaction, type DbClient } from '../db.js';
-import type { OrderRow, PaymentEventInput } from '../types.js';
-import { publicOrderId } from './orders.js';
-import { applyPaymentEvent, type PaymentEventRow } from './payment.js';
+import { applyGroupPayment, type PaymentEventRow } from './payment.js';
+import { chooseOffer, sellerReport, demoScenarioNotice } from './sellers.js';
+import type { Provider } from '../types.js';
+import { insertOrderGroup, getOrderGroup } from './order-groups.js';
 
 interface CartRow {
   sku: string;
+  offer_id: string;
+  offer_name: string;
+  provider: Provider;
+  seller_name: string;
+  demo_scenario: string | null;
+  seller_flag: string;
+  purchasable: boolean;
   name: string;
+  image: string;
   type: string;
   price_minor: string;
   currency: string;
@@ -17,21 +25,34 @@ interface CartRow {
   updated_at: Date;
 }
 
-export type CheckoutMethod = 'points' | 'code';
+export type CheckoutMethod = 'points' | 'code' | 'sbp' | 'crypto';
+import { createIntent } from './payment-intents.js';
+import { postWalletCredit } from './wallet.js';
 
 async function loadCart(client: DbClient, userId: string): Promise<Record<string, unknown>> {
   const result = await client.query<CartRow>(
-    `SELECT ci.sku, p.name, p.type, p.price_minor, p.currency, ci.quantity,
+    `SELECT ci.sku,ci.offer_id,f.name AS offer_name, p.name, p.image_path AS image, p.type, f.price_minor, f.currency, ci.quantity, ci.provider,s.display_name AS seller_name,s.demo_scenario, (p.active AND f.active AND s.banned_at IS NULL AND f.provider IS DISTINCT FROM (SELECT u.seller_id FROM users u WHERE u.id=ci.user_id) AND ci.quantity <= (SELECT count(*) FROM provider_inventory i WHERE i.offer_id=f.id AND i.claimed_by IS NULL AND i.revoked_at IS NULL AND i.reserved_order_id IS NULL)) AS purchasable,
+       CASE WHEN s.banned_at IS NOT NULL OR EXISTS(SELECT 1 FROM supplier_incidents si WHERE si.provider=ci.provider AND si.created_at>clock_timestamp()-interval '30 days') THEN 'red' ELSE 'none' END AS seller_flag,
        COALESCE((SELECT count(*)::integer FROM provider_inventory i
-                 WHERE i.sku = ci.sku AND i.claimed_by IS NULL), 0) AS available,
+                 WHERE i.offer_id=ci.offer_id AND i.claimed_by IS NULL AND i.revoked_at IS NULL AND i.reserved_order_id IS NULL), 0) AS available,
        ci.created_at, ci.updated_at
      FROM cart_items ci JOIN products p ON p.sku = ci.sku
+     JOIN seller_offers f ON f.id=ci.offer_id
+     JOIN supplier_configs s ON s.provider=ci.provider
      WHERE ci.user_id = $1 ORDER BY ci.created_at, ci.sku`,
     [userId],
   );
   const items = result.rows.map((row) => ({
     sku: row.sku,
+    offer_id: row.offer_id,
+    offer_name: row.offer_name,
+    provider: row.provider,
+    seller_name: row.seller_name,
+    demo_notice: demoScenarioNotice(row.demo_scenario),
+    seller_flag: row.seller_flag,
+    purchasable: row.purchasable,
     name: row.name,
+    image: row.image,
     type: row.type,
     price: Number(row.price_minor),
     currency: row.currency,
@@ -52,39 +73,66 @@ export async function cartReport(userId: string): Promise<Record<string, unknown
   return loadCart(getPool(), userId);
 }
 
-export async function addCartItem(userId: string, sku: string, quantity: number): Promise<Record<string, unknown>> {
+export async function addCartItem(
+  userId: string,
+  sku: string,
+  quantity: number,
+  requestedProvider?: Provider,
+  offerId?: string,
+): Promise<Record<string, unknown>> {
   return transaction(async (client) => {
+    await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [userId]);
     const product = await client.query('SELECT 1 FROM products WHERE sku = $1 AND active = true', [sku]);
     if (!product.rowCount) throw Object.assign(new Error('product_not_found'), { statusCode: 404 });
+    const offer = await chooseOffer(client, sku, requestedProvider, userId, offerId);
     const existing = await client.query<{ quantity: number }>(
-      'SELECT quantity FROM cart_items WHERE user_id = $1 AND sku = $2 FOR UPDATE',
-      [userId, sku],
+      'SELECT quantity FROM cart_items WHERE user_id = $1 AND sku = $2 AND offer_id=$3 FOR UPDATE',
+      [userId, sku, offer.id],
     );
     const nextQuantity = Number(existing.rows[0]?.quantity ?? 0) + quantity;
     if (nextQuantity > 10) throw Object.assign(new Error('cart_item_quantity_limit_10'), { statusCode: 409 });
     await client.query(
-      `INSERT INTO cart_items (user_id, sku, quantity) VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, sku) DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = now()`,
-      [userId, sku, nextQuantity],
+      `INSERT INTO cart_items (user_id, sku, quantity,provider,offer_id) VALUES ($1, $2, $3,$4,$5)
+       ON CONFLICT (user_id,offer_id) DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = now()`,
+      [userId, sku, nextQuantity, offer.provider, offer.id],
     );
     return loadCart(client, userId);
   });
 }
 
-export async function setCartItem(userId: string, sku: string, quantity: number): Promise<Record<string, unknown>> {
+export async function setCartItem(
+  userId: string,
+  sku: string,
+  quantity: number,
+  provider?: Provider,
+  offerId?: string,
+): Promise<Record<string, unknown>> {
   return transaction(async (client) => {
+    await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [userId]);
+    const selected = await selectCartOffer(client, userId, sku, provider, offerId);
     const updated = await client.query(
-      'UPDATE cart_items SET quantity = $3, updated_at = now() WHERE user_id = $1 AND sku = $2 RETURNING sku',
-      [userId, sku, quantity],
+      'UPDATE cart_items SET quantity = $3, updated_at = now() WHERE user_id = $1 AND sku = $2 AND offer_id=$4 RETURNING sku',
+      [userId, sku, quantity, selected],
     );
     if (!updated.rowCount) throw Object.assign(new Error('cart_item_not_found'), { statusCode: 404 });
     return loadCart(client, userId);
   });
 }
 
-export async function removeCartItem(userId: string, sku: string): Promise<Record<string, unknown>> {
+export async function removeCartItem(
+  userId: string,
+  sku: string,
+  provider?: Provider,
+  offerId?: string,
+): Promise<Record<string, unknown>> {
   return transaction(async (client) => {
-    await client.query('DELETE FROM cart_items WHERE user_id = $1 AND sku = $2', [userId, sku]);
+    await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [userId]);
+    const selected = await selectCartOffer(client, userId, sku, provider, offerId);
+    await client.query('DELETE FROM cart_items WHERE user_id = $1 AND sku = $2 AND offer_id=$3', [
+      userId,
+      sku,
+      selected,
+    ]);
     return loadCart(client, userId);
   });
 }
@@ -92,7 +140,11 @@ export async function removeCartItem(userId: string, sku: string): Promise<Recor
 function checkoutResponse(row: Record<string, unknown>): Record<string, unknown> {
   return {
     checkout_id: row.id,
+    order_id: row.group_id,
     method: row.method,
+    status: row.status,
+    payment_id: row.payment_intent_id ?? null,
+    external_amount: Number(row.external_amount),
     total_points: Number(row.total_points),
     code_value_points: Number(row.code_value_points),
     code_applied_points: Number(row.code_applied_points),
@@ -103,7 +155,11 @@ function checkoutResponse(row: Record<string, unknown>): Record<string, unknown>
   };
 }
 
-export async function cartQuote(userId: string, paymentCode?: string): Promise<Record<string, unknown>> {
+export async function cartQuote(
+  userId: string,
+  paymentCode?: string,
+  paymentMethod: 'balance' | 'sbp' | 'crypto' = 'balance',
+): Promise<Record<string, unknown>> {
   const userResult = await getPool().query<{ points_balance: string }>(
     'SELECT points_balance FROM users WHERE id = $1',
     [userId],
@@ -111,17 +167,42 @@ export async function cartQuote(userId: string, paymentCode?: string): Promise<R
   const user = userResult.rows[0];
   if (!user) throw Object.assign(new Error('user_not_found'), { statusCode: 404 });
 
-  const cartResult = await getPool().query<{ total_points: string; item_count: string }>(
-    `SELECT COALESCE(sum(p.price_minor * ci.quantity), 0)::bigint AS total_points,
-       COALESCE(sum(ci.quantity), 0)::bigint AS item_count
+  const cartResult = await getPool().query<{
+    total_points: string;
+    item_count: string;
+    purchasable: boolean;
+  }>(
+    `SELECT COALESCE(sum(f.price_minor * ci.quantity), 0)::bigint AS total_points,
+       COALESCE(sum(ci.quantity), 0)::bigint AS item_count, bool_and(p.active AND f.active AND s.banned_at IS NULL AND f.provider IS DISTINCT FROM (SELECT u.seller_id FROM users u WHERE u.id=ci.user_id) AND ci.quantity <= (SELECT count(*) FROM provider_inventory i WHERE i.offer_id=f.id AND i.claimed_by IS NULL AND i.revoked_at IS NULL AND i.reserved_order_id IS NULL)) AS purchasable
      FROM cart_items ci JOIN products p ON p.sku = ci.sku
-     WHERE ci.user_id = $1 AND p.active = true`,
+     JOIN seller_offers f ON f.id=ci.offer_id
+     JOIN supplier_configs s ON s.provider=ci.provider
+     WHERE ci.user_id = $1`,
     [userId],
   );
   const totalPoints = Number(cartResult.rows[0]?.total_points ?? 0);
   const itemCount = Number(cartResult.rows[0]?.item_count ?? 0);
+  const purchasable = cartResult.rows[0]?.purchasable === true;
   const balance = Number(user.points_balance);
   const normalizedCode = paymentCode?.trim().toUpperCase();
+  if (paymentMethod !== 'balance') {
+    if (paymentCode) throw Object.assign(new Error('code_requires_balance'), { statusCode: 400 });
+    return {
+      code: null,
+      code_status: 'none',
+      code_value_points: 0,
+      code_applied_points: 0,
+      points_to_charge: 0,
+      external_to_pay: totalPoints,
+      total_points: totalPoints,
+      item_count: itemCount,
+      balance_before: balance,
+      balance_after: balance,
+      can_checkout: purchasable && itemCount > 0,
+      error: itemCount === 0 ? 'cart_is_empty' : !purchasable ? 'cart_offer_unavailable' : null,
+      payment_method: paymentMethod,
+    };
+  }
 
   if (!normalizedCode) {
     const pointsToCharge = totalPoints;
@@ -135,8 +216,15 @@ export async function cartQuote(userId: string, paymentCode?: string): Promise<R
       item_count: itemCount,
       balance_before: balance,
       balance_after: balance - pointsToCharge,
-      can_checkout: itemCount > 0 && balance >= pointsToCharge,
-      error: itemCount === 0 ? 'cart_is_empty' : balance < pointsToCharge ? 'insufficient_points' : null,
+      can_checkout: purchasable && itemCount > 0 && balance >= pointsToCharge,
+      error:
+        itemCount === 0
+          ? 'cart_is_empty'
+          : !purchasable
+            ? 'cart_offer_unavailable'
+            : balance < pointsToCharge
+              ? 'insufficient_points'
+              : null,
     };
   }
 
@@ -185,59 +273,23 @@ export async function cartQuote(userId: string, paymentCode?: string): Promise<R
     item_count: itemCount,
     balance_before: balance,
     balance_after: balance - pointsToCharge,
-    can_checkout: itemCount > 0 && balance >= pointsToCharge,
-    error: itemCount === 0 ? 'cart_is_empty' : balance < pointsToCharge ? 'insufficient_points' : null,
+    can_checkout: purchasable && itemCount > 0 && balance >= pointsToCharge,
+    error:
+      itemCount === 0
+        ? 'cart_is_empty'
+        : !purchasable
+          ? 'cart_offer_unavailable'
+          : balance < pointsToCharge
+            ? 'insufficient_points'
+            : null,
   };
-}
-
-async function createPaidOrder(
-  client: PoolClient,
-  userId: string,
-  item: CartRow,
-  checkoutId: string,
-  unitIndex: number,
-  method: CheckoutMethod,
-): Promise<string> {
-  const orderId = publicOrderId();
-  const insertedOrder = await client.query<OrderRow>(
-    `INSERT INTO orders (id, sku, amount, currency, user_id)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [orderId, item.sku, item.price_minor, item.currency, userId],
-  );
-  const order = insertedOrder.rows[0];
-  if (!order) throw new Error('Checkout order was not returned');
-
-  const eventInput: PaymentEventInput = {
-    event_id: `evt_checkout_${checkoutId}_${unitIndex}`,
-    order_id: orderId,
-    status: 'paid',
-    amount: Number(item.price_minor),
-    currency: item.currency,
-    created_at: new Date().toISOString(),
-  };
-  const insertedEvent = await client.query<PaymentEventRow>(
-    `INSERT INTO payment_events
-      (event_id, order_id, status, amount, currency, event_created_at, payload)
-     VALUES ($1, $2, 'paid', $3, $4, $5, $6::jsonb) RETURNING *`,
-    [
-      eventInput.event_id,
-      orderId,
-      eventInput.amount,
-      eventInput.currency,
-      eventInput.created_at,
-      JSON.stringify({ ...eventInput, source: `cart_${method}`, checkout_id: checkoutId }),
-    ],
-  );
-  const event = insertedEvent.rows[0];
-  if (!event) throw new Error('Checkout payment event was not returned');
-  await applyPaymentEvent(client, order, event);
-  return orderId;
 }
 
 export async function checkoutCart(
   userId: string,
   checkoutId: string,
   paymentCode?: string,
+  paymentMethod: 'balance' | 'sbp' | 'crypto' = 'balance',
 ): Promise<Record<string, unknown>> {
   return transaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [checkoutId]);
@@ -246,25 +298,80 @@ export async function checkoutCart(
       if (existing.rows[0].user_id !== userId) {
         throw Object.assign(new Error('checkout_id_conflict'), { statusCode: 409 });
       }
+      const expectedMethod =
+        paymentMethod === 'balance' ? (paymentCode?.trim() ? 'code' : 'points') : paymentMethod;
+      if (existing.rows[0].method !== expectedMethod)
+        throw Object.assign(new Error('checkout_id_payload_conflict'), { statusCode: 409 });
+      if ((existing.rows[0].payment_code ?? undefined) !== (paymentCode?.trim().toUpperCase() || undefined)) {
+        throw Object.assign(new Error('checkout_id_payload_conflict'), { statusCode: 409 });
+      }
       return checkoutResponse(existing.rows[0]);
     }
 
     const userResult = await client.query<{ points_balance: string }>(
-      'SELECT points_balance FROM users WHERE id = $1 FOR UPDATE',
+      'SELECT points_balance FROM users WHERE id = $1 AND banned_at IS NULL FOR UPDATE',
       [userId],
     );
     const user = userResult.rows[0];
     if (!user) throw Object.assign(new Error('user_not_found'), { statusCode: 404 });
 
     const cartResult = await client.query<CartRow>(
-      `SELECT ci.sku, p.name, p.type, p.price_minor, p.currency, ci.quantity,
+      `SELECT ci.sku,ci.offer_id,f.name AS offer_name, p.name, p.image_path AS image, p.type, f.price_minor, f.currency, ci.quantity, ci.provider,s.display_name AS seller_name,s.demo_scenario, (p.active AND f.active AND s.banned_at IS NULL AND f.provider IS DISTINCT FROM (SELECT u.seller_id FROM users u WHERE u.id=ci.user_id) AND ci.quantity <= (SELECT count(*) FROM provider_inventory i WHERE i.offer_id=f.id AND i.claimed_by IS NULL AND i.revoked_at IS NULL AND i.reserved_order_id IS NULL)) AS purchasable,
+       CASE WHEN s.banned_at IS NOT NULL OR EXISTS(SELECT 1 FROM supplier_incidents si WHERE si.provider=ci.provider AND si.created_at>clock_timestamp()-interval '30 days') THEN 'red' ELSE 'none' END AS seller_flag,
          0::integer AS available, ci.created_at, ci.updated_at
        FROM cart_items ci JOIN products p ON p.sku = ci.sku
-       WHERE ci.user_id = $1 AND p.active = true ORDER BY ci.created_at, ci.sku FOR UPDATE OF ci`,
+     JOIN seller_offers f ON f.id=ci.offer_id
+     JOIN supplier_configs s ON s.provider=ci.provider
+       WHERE ci.user_id = $1 ORDER BY ci.created_at, ci.sku FOR UPDATE OF ci FOR SHARE OF f, s`,
       [userId],
     );
     if (!cartResult.rowCount) throw Object.assign(new Error('cart_is_empty'), { statusCode: 409 });
-    const totalPoints = cartResult.rows.reduce((sum, item) => sum + Number(item.price_minor) * item.quantity, 0);
+    if (cartResult.rows.some((row) => !row.purchasable))
+      throw Object.assign(new Error('cart_offer_unavailable'), { statusCode: 409 });
+    const totalPoints = cartResult.rows.reduce(
+      (sum, item) => sum + Number(item.price_minor) * item.quantity,
+      0,
+    );
+    if (paymentMethod !== 'balance') {
+      if (paymentCode) throw Object.assign(new Error('code_requires_balance'), { statusCode: 400 });
+      const orderIds = await insertOrderGroup(
+        client,
+        cartResult.rows.map((item) => ({
+          sku: item.sku,
+          quantity: item.quantity,
+          provider: item.provider,
+          offer_id: item.offer_id,
+        })),
+        checkoutId,
+        userId,
+        paymentMethod,
+      );
+      const intent = await createIntent(client, {
+        id: `pay_${randomUUID().replaceAll('-', '')}`,
+        userId,
+        purpose: 'checkout',
+        method: paymentMethod,
+        amount: totalPoints,
+        groupId: checkoutId,
+      });
+      const checkout = (
+        await client.query(
+          `INSERT INTO checkouts(id,user_id,method,total_points,code_value_points,code_applied_points,points_charged,balance_after,order_ids,group_id,status,external_amount,payment_intent_id)
+        VALUES($1,$2,$3,$4,0,0,0,$5,$6,$1,'pending',$4,$7) RETURNING *`,
+          [
+            checkoutId,
+            userId,
+            paymentMethod,
+            totalPoints,
+            user.points_balance,
+            JSON.stringify(orderIds),
+            intent.id,
+          ],
+        )
+      ).rows[0];
+      await client.query('DELETE FROM cart_items WHERE user_id=$1', [userId]);
+      return checkoutResponse(checkout);
+    }
     let balanceAfter = Number(user.points_balance);
     const normalizedCode = paymentCode?.trim().toUpperCase() || undefined;
     const method: CheckoutMethod = normalizedCode ? 'code' : 'points';
@@ -285,34 +392,67 @@ export async function checkoutCart(
       pointsCharged = totalPoints - codeAppliedPoints;
     }
 
-    if (balanceAfter < pointsCharged) throw Object.assign(new Error('insufficient_points'), { statusCode: 409 });
+    if (balanceAfter < pointsCharged)
+      throw Object.assign(new Error('insufficient_points'), { statusCode: 409 });
     balanceAfter -= pointsCharged;
     if (pointsCharged > 0) {
-      await client.query('UPDATE users SET points_balance = $2, updated_at = now() WHERE id = $1', [userId, balanceAfter]);
+      await client.query('UPDATE users SET points_balance = $2, updated_at = now() WHERE id = $1', [
+        userId,
+        balanceAfter,
+      ]);
     }
     if (normalizedCode) {
-      await client.query(
-        'UPDATE payment_codes SET used_by = $2, used_at = now() WHERE code = $1',
-        [normalizedCode, userId],
-      );
+      await client.query('UPDATE payment_codes SET used_by = $2, used_at = now() WHERE code = $1', [
+        normalizedCode,
+        userId,
+      ]);
     }
 
-    const orderIds: string[] = [];
-    let unitIndex = 0;
-    for (const item of cartResult.rows) {
-      for (let quantityIndex = 0; quantityIndex < item.quantity; quantityIndex += 1) {
-        unitIndex += 1;
-        orderIds.push(await createPaidOrder(client, userId, item, checkoutId, unitIndex, method));
-      }
-    }
+    const orderIds = await insertOrderGroup(
+      client,
+      cartResult.rows.map((item) => ({
+        sku: item.sku,
+        quantity: item.quantity,
+        provider: item.provider,
+        offer_id: item.offer_id,
+      })),
+      checkoutId,
+      userId,
+      'wallet',
+    );
+    await postWalletCredit(client, userId, codeAppliedPoints, 'code_credit', `code:${checkoutId}`);
+    const eventId = `evt_checkout_${checkoutId}`;
+    const event = await client.query<PaymentEventRow>(
+      `INSERT INTO payment_events
+      (event_id,order_id,status,amount,currency,event_created_at,payload)
+      VALUES ($1,$2,'paid',$3,$4,clock_timestamp(),$5) RETURNING *`,
+      [
+        eventId,
+        checkoutId,
+        totalPoints,
+        cartResult.rows[0]!.currency,
+        JSON.stringify({ source: `cart_${method}`, checkout_id: checkoutId }),
+      ],
+    );
+    await applyGroupPayment(client, event.rows[0]!);
 
     const checkout = await client.query(
       `INSERT INTO checkouts
        (id, user_id, method, total_points, payment_code, code_value_points,
-        code_applied_points, points_charged, balance_after, order_ids)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) RETURNING *`,
-      [checkoutId, userId, method, totalPoints, normalizedCode ?? null, codeValuePoints,
-        codeAppliedPoints, pointsCharged, balanceAfter, JSON.stringify(orderIds)],
+        code_applied_points, points_charged, balance_after, order_ids, group_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $1) RETURNING *`,
+      [
+        checkoutId,
+        userId,
+        method,
+        totalPoints,
+        normalizedCode ?? null,
+        codeValuePoints,
+        codeAppliedPoints,
+        pointsCharged,
+        balanceAfter,
+        JSON.stringify(orderIds),
+      ],
     );
     if (pointsCharged > 0) {
       await client.query(
@@ -330,9 +470,9 @@ export async function checkoutCart(
 
 export async function purchaseHistory(userId: string): Promise<Record<string, unknown>> {
   const result = await getPool().query(
-    `SELECT o.id, o.sku, p.name, p.type, o.amount::bigint AS amount, o.currency,
-       o.status, o.payment_state, o.created_at, o.delivered_at,
-       d.provider, d.code
+    `SELECT o.id, o.sku,o.assigned_offer_id,o.offer_name, p.name, p.image_path AS image, p.type, o.amount::bigint AS amount, o.currency,
+       'wallet'::text AS refund_destination,o.group_id, o.status, o.payment_state, o.created_at, o.delivered_at,
+       d.provider, CASE WHEN o.status='refunded' THEN NULL ELSE d.code END AS code
      FROM orders o JOIN products p ON p.sku = o.sku
      LEFT JOIN deliveries d ON d.order_id = o.id
      WHERE o.user_id = $1
@@ -341,25 +481,40 @@ export async function purchaseHistory(userId: string): Promise<Record<string, un
   );
   return {
     purchases: result.rows.map((row) => ({ ...row, amount: Number(row.amount) })),
+    orders: await Promise.all(
+      [...new Set(result.rows.map((r) => r.group_id).filter(Boolean))].map((id) =>
+        getOrderGroup(id, undefined, userId),
+      ),
+    ),
   };
 }
 
-export async function purchaseDetail(userId: string, orderId: string): Promise<Record<string, unknown> | undefined> {
+export async function purchaseDetail(
+  userId: string,
+  orderId: string,
+): Promise<Record<string, unknown> | undefined> {
   const result = await getPool().query(
-    `SELECT o.id, o.sku, p.name, p.type, p.image_path, p.description, p.features,
+    `SELECT o.id, o.sku,o.assigned_offer_id,o.offer_name, p.name, p.image_path AS image, p.type, p.image_path, p.description, p.features,
        o.amount::bigint AS amount,
-       o.currency, o.status, o.payment_state, o.created_at, o.delivered_at,
-       d.request_id, d.provider, d.code
+       'wallet'::text AS refund_destination,o.currency, o.group_id, o.status, o.payment_state, o.created_at, o.delivered_at,
+       d.request_id, COALESCE(d.provider,o.assigned_provider) AS provider, CASE WHEN o.status='refunded' THEN NULL ELSE d.code END AS code,
+       (SELECT to_jsonb(r) FROM seller_reviews r WHERE r.order_id=o.id) AS review,
+       (o.status IN ('delivered','refunded') AND NOT EXISTS(SELECT 1 FROM seller_reviews r WHERE r.order_id=o.id)) AS can_review
      FROM orders o JOIN products p ON p.sku = o.sku
      LEFT JOIN deliveries d ON d.order_id = o.id
      WHERE o.user_id = $1 AND o.id = $2`,
     [userId, orderId],
   );
   const row = result.rows[0];
-  return row ? { ...row, amount: Number(row.amount) } : undefined;
+  return row
+    ? { ...row, amount: Number(row.amount), seller: row.provider ? await sellerReport(row.provider) : null }
+    : undefined;
 }
 
-export async function addPaymentCodes(codes: string[], valuePoints: number): Promise<Record<string, unknown>> {
+export async function addPaymentCodes(
+  codes: string[],
+  valuePoints: number,
+): Promise<Record<string, unknown>> {
   return transaction(async (client) => {
     const inserted: string[] = [];
     const duplicates: string[] = [];
@@ -393,4 +548,21 @@ export async function paymentCodesReport(): Promise<Record<string, unknown>> {
 
 export function publicCheckoutId(): string {
   return `chk_${randomUUID().replaceAll('-', '')}`;
+}
+
+async function selectCartOffer(
+  client: DbClient,
+  userId: string,
+  sku: string,
+  provider?: Provider,
+  offerId?: string,
+): Promise<string> {
+  const rows = await client.query(
+    'SELECT offer_id FROM cart_items WHERE user_id=$1 AND sku=$2 AND ($3::text IS NULL OR provider=$3) AND ($4::text IS NULL OR offer_id=$4)',
+    [userId, sku, provider ?? null, offerId ?? null],
+  );
+  if (rows.rowCount && rows.rowCount > 1)
+    throw Object.assign(new Error('select_cart_item_offer'), { statusCode: 409 });
+  if (!rows.rowCount) throw Object.assign(new Error('cart_item_not_found'), { statusCode: 404 });
+  return rows.rows[0].offer_id;
 }
