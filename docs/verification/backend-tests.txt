@@ -1,0 +1,101 @@
+ Container backend-postgres-test-1  Running
+time="2026-09-08T20:26:20+02:00" level=warning msg="Docker Compose is configured to build using Bake, but buildx isn't installed"
+#0 building with "default" instance using docker driver
+
+#1 [tests internal] load build definition from Dockerfile
+#1 transferring dockerfile: 577B done
+#1 DONE 0.0s
+
+#2 [tests internal] load metadata for docker.io/library/node:24-alpine
+#2 DONE 0.0s
+
+#3 [tests internal] load .dockerignore
+#3 transferring context: 78B done
+#3 DONE 0.0s
+
+#4 [tests internal] load build context
+#4 DONE 0.0s
+
+#5 [tests build 1/6] FROM docker.io/library/node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf
+#5 resolve docker.io/library/node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf 0.0s done
+#5 DONE 0.0s
+
+#4 [tests internal] load build context
+#4 transferring context: 170.22kB 0.0s done
+#4 DONE 0.0s
+
+#6 [tests build 2/6] WORKDIR /app
+#6 CACHED
+
+#7 [tests build 3/6] COPY package*.json ./
+#7 CACHED
+
+#8 [tests build 4/6] RUN npm ci
+#8 CACHED
+
+#9 [tests build 5/6] COPY . .
+#9 DONE 0.1s
+
+#10 [tests build 6/6] RUN npm run build
+#10 0.900 
+#10 0.900 > game-goods-backend@1.0.0 build
+#10 0.900 > tsc -p tsconfig.json
+#10 0.900 
+#10 DONE 3.5s
+
+#11 [tests] exporting to image
+#11 exporting layers
+#11 exporting layers 0.2s done
+#11 exporting manifest sha256:c275a51e8522c0ca4e2601efab517c000700feac7e85a2088958aff84b8151be 0.0s done
+#11 exporting config sha256:8d10576cdbb202293889191b9dd102865e9ccc198374fae5e5b770ec0bdf7bef 0.0s done
+#11 exporting attestation manifest sha256:1cf5c422d324e94f05cdc9361704faa83140e0654be9bb1463db23b59926dd59 0.0s done
+#11 exporting manifest list sha256:9a57de007ff23fe61c1495a2a2f1b39d48624057924427ed839a2e8560bdd3a0 0.0s done
+#11 naming to docker.io/library/backend-tests:latest
+#11 naming to docker.io/library/backend-tests:latest done
+#11 unpacking to docker.io/library/backend-tests:latest 0.1s done
+#11 DONE 0.4s
+
+#12 [tests] resolving provenance for metadata file
+#12 DONE 0.0s
+
+> game-goods-backend@1.0.0 test
+> vitest run
+
+
+ RUN  v3.2.7 /app
+
+(node:42) DeprecationWarning: Calling client.query() when the client is already executing a query is deprecated and will be removed in pg@9.0. Use async/await or an external async flow control mechanism instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+ ✓ tests/acceptance.test.ts (71 tests) 21248ms
+   ✓ adversarial acceptance scenarios > handles 50 parallel paid webhooks and one duplicate with one delivery fact  427ms
+   ✓ adversarial acceptance scenarios > retries the same provider/request_id after timeout-after-issue without a second issuance  393ms
+   ✓ adversarial acceptance scenarios > refunds a legacy order once after bounded A and B failures  314ms
+   ✓ adversarial acceptance scenarios > checks out a server cart with points exactly once and exposes dated clickable purchase details  380ms
+   ✓ stage two: composed orders, adversarial suppliers and history > automatically resolves duplicate_code and exposes only a verified unique key  320ms
+   ✓ stage two: composed orders, adversarial suppliers and history > automatically resolves timeout_after_issue and exposes only a verified unique key  428ms
+   ✓ stage two: composed orders, adversarial suppliers and history > cancels an unissued timed-out request before refund, forbidding delayed issuance  847ms
+   ✓ stage two: composed orders, adversarial suppliers and history > recovers after an actual SIGKILL between supplier commit and local delivery commit  451ms
+   ✓ stage two: composed orders, adversarial suppliers and history > fences an expired worker while another worker resumes its committed issuance  975ms
+   ✓ stage two: composed orders, adversarial suppliers and history > credits the complete failed position to the wallet once, including payment-code value, and checks ownership  329ms
+   ✓ seller offers, verified reviews and evidence-based reputation > accepts exactly one verified 1–5 star review after completion and rejects fake or premature reviews  387ms
+   ✓ private dashboards, moderation and refunds > enforces database roles and ownership on dashboards, orders, history and chat  313ms
+   ✓ private dashboards, moderation and refunds > refunds an issued purchase once, revokes its key, reverses sales and closes the persisted chat  325ms
+   ✓ a seller-account ban closes every account bound to that seller and can be lifted  306ms
+   ✓ marketplace registration and persistent simulated payments > captures sbp only after confirmation, once under concurrent repeats  302ms
+   ✓ marketplace registration and persistent simulated payments > captures crypto only after confirmation, once under concurrent repeats  300ms
+   ✓ seller products and financial results > keeps sale price/cost snapshots, reverses income once and retains the cost of revoked keys  419ms
+   ✓ seller products and financial results > distinguishes unknown procurement cost from a free key and protects private cost changes  305ms
+   ✓ seller products and financial results > paginates all seller orders without limiting totals to the visible page  487ms
+   ✓ seller stock lots and reservation integrity > prices two concrete keys independently at 1 and 2 and delivers the exact keys for 3  373ms
+   ✓ seller stock lots and reservation integrity > lists all 1000 keys with stable server pagination and literal search scoped to the seller  382ms
+   ✓ seller stock lots and reservation integrity > splits exactly 1000 existing keys into 200/400/400 once under concurrent retries  550ms
+   ✓ seller stock lots and reservation integrity > keeps three prices in one cart and delivers only the exact selected lot with fixed historic profit  433ms
+   ✓ seller stock lots and reservation integrity > reserves the last key for exactly one concurrent buyer and cannot move or reprice its procurement  365ms
+   ✓ seller stock lots and reservation integrity > releases failed payment reservations and refuses to substitute another lot on retry  309ms
+   ✓ seller stock lots and reservation integrity > releases cancelled payment reservations and refuses to substitute another lot on retry  331ms
+
+ Test Files  1 passed (1)
+      Tests  71 passed (71)
+   Start at  18:26:25
+   Duration  21.92s (transform 244ms, setup 0ms, collect 491ms, tests 21.25s, environment 0ms, prepare 53ms)
+

@@ -1,0 +1,49 @@
+{
+  "order_id": "ord_08bbcb7064434e849460fd71c3c33598",
+  "status": "partially_refunded",
+  "money": {
+    "paid": 2389,
+    "delivered": 1990,
+    "refunded": 399,
+    "pending": 0,
+    "balanced": true,
+    "settled": true
+  },
+  "items": [
+    {
+      "id": "ord_32428f59f80c4d3cb1a262385513d121",
+      "sku": "SUB-DISCORD-1M",
+      "provider": "demo_empty_mtsx9vqx",
+      "status": "refunded"
+    },
+    {
+      "id": "ord_5d709001d4734930879d0de450665ced",
+      "sku": "KEY-GTA5",
+      "provider": "demo_bad_mtsx9vqx",
+      "status": "delivered"
+    },
+    {
+      "id": "ord_d0449ac411d94469ad9187a1f07f297d",
+      "sku": "STEAM-TOPUP-500",
+      "provider": "demo_good_mtsx9vqx",
+      "status": "delivered"
+    }
+  ],
+  "seller": {
+    "id": "demo_bad_mtsx9vqx",
+    "flag": "red",
+    "confirmed_incidents": 1
+  },
+  "history_before_payment": {
+    "status": "created",
+    "money": {
+      "paid": 0,
+      "delivered": 0,
+      "refunded": 0,
+      "pending": 0,
+      "balanced": true,
+      "settled": false
+    }
+  },
+  "repeat_preserves_money": true
+}

@@ -1,261 +1,170 @@
-# Game Goods Backend
+# Store Backend — второй этап
 
-Самостоятельный backend тестового магазина цифровых товаров. Проект содержит
-Fastify API, PostgreSQL, миграции, seed каталога и кодов, фонового worker,
-эмуляторы двух поставщиков, reconciliation, double-entry ledger и интеграционные
-тесты. Frontend в этот образ не встроен и запускается отдельным проектом.
+[![Backend verification](https://github.com/ps5tur5-sketch/Store-Backend/actions/workflows/verify.yml/badge.svg)](https://github.com/ps5tur5-sketch/Store-Backend/actions/workflows/verify.yml)
+Fastify, TypeScript, PostgreSQL. Сохранены прежние `src/`, `services/`, `scripts/`, миграции и Docker Compose. Серверная часть [задания второго этапа](docs/assignment-stage2.pdf). [Ответы по формату сдачи](docs/SUBMISSION.md) · [Что изменилось](CHANGELOG.md) · [Архитектура и гарантии](docs/ARCHITECTURE.md) · [Проверки](docs/VERIFICATION.md).
 
-Парный самостоятельный frontend:
-<https://github.com/ps5tur5-sketch/Store-Frontend>.
+Дополнительный интерфейс находится в [Store-Frontend](https://github.com/ps5tur5-sketch/Store-Frontend). Все четыре задачи PDF выполняются и проверяются без frontend.
 
-## Быстрый запуск
+## Команды
 
-Нужен только Docker с Compose plugin. Node.js, npm и PostgreSQL на хосте не нужны.
+После клонирования репозитория:
 
 ```bash
+git clone https://github.com/ps5tur5-sketch/Store-Backend.git
+cd Store-Backend
+cp .env.example .env
 docker compose up -d --build
-```
-
-После запуска:
-
-- API: <http://127.0.0.1:3000>;
-- healthcheck: <http://127.0.0.1:3000/health>;
-- PostgreSQL: `127.0.0.1:5432`;
-- миграции `001`–`005` и seed выполняются автоматически;
-- данные базы сохраняются в именованном volume.
-
-Проверка:
-
-```bash
-docker compose ps
-curl http://127.0.0.1:3000/health
-docker compose logs -f backend
-```
-
-Остановка без удаления данных:
-
-```bash
-docker compose down
-```
-
-Полный сброс тестовой базы — разрушительная операция:
-
-```bash
-docker compose down -v
-docker compose up -d --build
-```
-
-## Настройка через `.env`
-
-Compose читает `.env` из корня backend. Для переноса на сервер код менять не
-нужно.
-
-| Переменная | Default | Назначение |
-|---|---:|---|
-| `BACKEND_BIND_IP` | `0.0.0.0` | интерфейс публикации API |
-| `BACKEND_PORT` | `3000` | внешний порт API |
-| `POSTGRES_BIND_IP` | `127.0.0.1` | интерфейс публикации PostgreSQL |
-| `POSTGRES_PORT` | `5432` | внешний порт PostgreSQL |
-| `POSTGRES_DB` | `hr` | имя базы |
-| `POSTGRES_USER` | `hr` | пользователь базы |
-| `POSTGRES_PASSWORD` | `hr` | пароль тестовой базы |
-| `LOG_LEVEL` | `info` | уровень JSON-логов |
-| `WORKER_ENABLED` | `true` | автоматическая выдача товаров |
-| `WORKER_POLL_MS` | `200` | интервал worker |
-| `RECOVERY_POLL_MS` | `5000` | интервал восстановления |
-| `SUPPLIER_TIMEOUT_MS` | `300` | HTTP timeout поставщика |
-| `SUPPLIER_MAX_ATTEMPTS` | `3` | число попыток |
-| `SUPPLIER_BACKOFF_MS` | `50` | база exponential backoff |
-| `ENABLE_TEST_CONTROLS` | `true` | вспомогательные endpoints стенда |
-
-Пример публикации на сервере:
-
-```dotenv
-BACKEND_BIND_IP=0.0.0.0
-BACKEND_PORT=3000
-POSTGRES_BIND_IP=127.0.0.1
-```
-
-После изменения `.env` достаточно:
-
-```bash
-docker compose up -d --build
-```
-
-Backend включает универсальный CORS (`origin: true`), поэтому frontend может
-работать с другого IP/порта. Это сознательная настройка тестового стенда без
-защиты; для production нужны авторизация admin API, ограниченный CORS, HTTPS,
-секрет webhook и реальные пароли.
-
-## Пользовательская модель
-
-1. Регистрация выполняется по логину и паролю, без email.
-2. Новый пользователь получает ровно 5000 баллов.
-3. Товары сначала добавляются в серверную корзину.
-4. Checkout оплачивается баллами либо одноразовым кодом и баллами вместе.
-5. На каждую единицу корзины создаётся отдельный заказ.
-6. Worker случайно резервирует свободный товарный ключ и сохраняет его в покупке.
-7. История покупок возвращается от новой к старой.
-
-### Расчёт платёжного кода
-
-Номинал каждого кода хранится в `payment_codes.value_points`. Код никогда не
-покрывает всю корзину сам по себе, если его номинал меньше стоимости:
-
-```text
-code_applied_points = min(code_value_points, total_points)
-points_charged      = total_points - code_applied_points
-balance_after       = balance_before - points_charged
-```
-
-Пример: корзина `10739`, код `5000`, баланс `5000` → с баланса требуется `5739`,
-поэтому checkout отклоняется с `insufficient_points`; код не расходуется.
-
-Пример: корзина `7500`, код `5000`, баланс `5000` → код вычитает `5000`, с
-баланса списывается `2500`, остаток баланса `2500`; после commit код одноразово
-помечается использованным.
-
-`POST /api/cart/quote` делает read-only расчёт для интерфейса. Он не погашает код.
-`POST /api/cart/checkout` повторяет расчёт внутри PostgreSQL-транзакции с lock
-пользователя и кода. Ответ checkout содержит:
-
-```json
-{
-  "checkout_id": "chk_example",
-  "method": "code",
-  "total_points": 7500,
-  "code_value_points": 5000,
-  "code_applied_points": 5000,
-  "points_charged": 2500,
-  "balance_after": 2500,
-  "order_ids": ["ord_...", "ord_...", "ord_..."]
-}
-```
-
-50 конкретных строк из ТЗ seed-ятся и как складские ключи, и как независимые
-одноразовые платёжные коды начального номинала 5000. Новые платёжные коды с
-произвольным номиналом до 10 000 000 добавляются через admin API. Расходование
-платёжного кода не расходует одноимённую складскую запись.
-
-Любой новый складской ключ из `POST /api/admin/inventory` автоматически становится
-и платёжным кодом. Его номинал равен цене выбранного SKU, а `source_sku` хранит
-источник. Если код уже был явно создан как платёжный, его ручной номинал не
-перезаписывается. Миграция `005` регистрирует этим же способом ранее добавленные
-складские ключи.
-
-## Основные API
-
-Все ответы JSON. Пользовательские endpoints после регистрации требуют заголовок
-`Authorization: Bearer TOKEN`.
-
-| Method | Path | Назначение |
-|---|---|---|
-| `GET` | `/health` | readiness API и базы |
-| `GET` | `/api/catalog` | каталог, поиск, фильтр, пагинация |
-| `GET` | `/api/catalog/:sku` | товар, описание и характеристики |
-| `POST` | `/api/auth/register` | регистрация login/password + 5000 |
-| `POST` | `/api/auth/login` | новая bearer-session |
-| `POST` | `/api/auth/logout` | удалить текущую session |
-| `GET` | `/api/account` | пользователь, баланс, транзакции |
-| `GET` | `/api/cart` | корзина пользователя |
-| `POST` | `/api/cart/items` | добавить SKU и количество |
-| `PUT` | `/api/cart/items/:sku` | установить количество |
-| `DELETE` | `/api/cart/items/:sku` | удалить строку |
-| `POST` | `/api/cart/quote` | рассчитать код и остаток оплаты |
-| `POST` | `/api/cart/checkout` | атомарно купить корзину |
-| `GET` | `/api/account/purchases` | история, новые сверху |
-| `GET` | `/api/account/purchases/:id` | полная карточка и выданный код |
-| `POST` | `/api/orders` | низкоуровневое создание заказа |
-| `GET` | `/api/orders/:id` | состояние и попытки доставки |
-| `POST` | `/api/orders/:id/simulate-payment` | эмуляция `paid`/`failed` |
-| `POST` | `/webhook/payment` | контракт платёжного webhook |
-
-Admin/recovery endpoints открыты намеренно:
-
-| Method | Path | Назначение |
-|---|---|---|
-| `GET/POST` | `/api/admin/inventory` | складские ключи + автосоздание кода по цене SKU |
-| `GET/POST` | `/api/admin/payment-codes` | одноразовые платёжные коды и номиналы |
-| `GET` | `/api/admin/suppliers` | chaos-настройки поставщиков |
-| `PUT` | `/api/admin/suppliers/:provider` | изменить режим A/B |
-| `POST` | `/api/admin/workers/run` | вручную обработать delivery jobs |
-| `GET` | `/api/admin/summary` | заказы, склад и ledger |
-| `GET` | `/api/reconciliation` | найти аномалии |
-| `POST` | `/api/reconciliation/recover` | безопасное восстановление |
-
-Добавление платёжных кодов:
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/admin/payment-codes \
-  -H 'content-type: application/json' \
-  -d '{"codes":["MY-CODE-5000"],"value_points":5000}'
-```
-
-## Надёжность выдачи
-
-- `payment_events.event_id` уникален, повторы webhook идемпотентны;
-- advisory transaction lock сериализует изменения заказа;
-- один durable `delivery_job` и стабильный `request_id` на заказ;
-- worker использует `FOR UPDATE SKIP LOCKED` и lease;
-- поставщик идемпотентен по `(provider, request_id)`;
-- delivery, складской code и наблюдаемый delivery fact уникальны;
-- `timeout_after_issue` повторяется на том же поставщике без unsafe fallback;
-- явные `5xx`/`out_of_stock` разрешают A→B fallback;
-- recovery поднимает pending events, истёкшие leases и оплаченные заказы без
-  доставки;
-- каждая операция оплаты создаёт сбалансированную double-entry проводку.
-
-## Тесты
-
-Тесты полностью запускаются в Docker и используют отдельный PostgreSQL на tmpfs:
-
-```bash
 docker compose --profile test run --rm --build tests
-```
-
-13 интеграционных сценариев проверяют параллельные webhook, повторы event ID,
-webhook до заказа, out-of-order события, timeout-after-issue, fallback,
-out-of-stock/restock, recovery, double-entry ledger, параллельную выдачу,
-регистрацию, серверную корзину, идемпотентный checkout, частичную оплату кодом,
-одноразовость кода и admin API.
-
-Дополнительные сценарии против работающего backend:
-
-```bash
-docker compose exec backend node dist/scripts/race.js
-docker compose exec backend node dist/scripts/scenario-timeout.js
-docker compose exec backend node dist/scripts/scenario-fallback.js
-docker compose exec backend node dist/scripts/scenario-out-of-stock.js
+docker compose exec backend node dist/scripts/scenario-stage2.js
 docker compose exec backend node dist/scripts/reconcile.js
-docker compose exec backend node dist/scripts/explain-catalog.js
 ```
 
-## Разработка без Docker
+Для разработки: `npm ci`, `npm run dev`. Настройки читаются из окружения процесса; Compose подставляет свой `.env`. При запуске Node.js на хосте укажите `DATABASE_URL` для опубликованного порта PostgreSQL. `npm run db:reset` намеренно очищает бизнес-данные, для обычного обновления используется миграция при старте.
 
-Требуются Node.js 22+ и PostgreSQL 17.
+API: http://127.0.0.1:3000, проверка готовности — `/health`. Если локальный порт PostgreSQL 5432 занят, задайте `POSTGRES_PORT=5433` в `.env`; адрес внутри Docker остаётся `postgres:5432`. Миграции применяются автоматически, именованный volume сохраняется. Для обновления уже установленного проекта выполните `git pull --ff-only` и `docker compose up -d --build`; `cp .env.example .env` нужен только при первом запуске.
 
-```bash
-npm ci
-npm run db:migrate
-npm run db:seed
-npm run dev
-```
+## Демо-аккаунты
 
-Проверки:
+| Роль | Логин | Начальный пароль |
+| --- | --- | --- |
+| Администратор | `admin_demo` | `AdminDemo2026!` |
+| Pixel Market / Game Point | `seller_a` / `seller_b` | `SellerDemo2026!` |
+| Nova Games / Play Hub | `seller_nova` / `seller_play` | `SellerDemo2026!` |
+| Проверка ключа / автоматический возврат | `seller_check` / `seller_refund` | `SellerDemo2026!` |
+| Покупатель | самостоятельная регистрация | задаётся при регистрации |
 
-```bash
-npm run typecheck
-npm test
-npm run build
-```
+Пароли и внутренний секрет поставщика из `.env.example` — общедоступные настройки локального демо. Seed создаёт аккаунты только при отсутствии и не сбрасывает пароль существующего пользователя. Покупатель получает 5000 тестовых рублей один раз. `DEMO_MARKETPLACE=true` добавляет 7200 стабильных ключей у шести продавцов; повторный запуск не восстанавливает выданный товар. Demo Refund намеренно возвращает оплату на баланс, остальные обычные продавцы выдают ключи. Регистрация продавца и подключение магазина к покупателю поддерживаются API.
 
-## Структура
+## Данные
 
-```text
-src/          Fastify API, worker и бизнес-логика
-migrations/   PostgreSQL schema и индексы
-scripts/      migration/seed и воспроизводимые сценарии
-tests/        интеграционные acceptance tests
-Dockerfile    multi-stage production image
-docker-compose.yml  backend + PostgreSQL + test profile
-```
+| Таблицы | Назначение |
+| --- | --- |
+| `products`, `supplier_configs`, `seller_offers` | Каталог, продавцы, цены и доступность предложений |
+| `provider_inventory`, `provider_issuances`, `supplier_cancellations` | Проверяемый реестр ключей, выдачи и подтверждённые отмены |
+| `orders`, `order_groups` | Позиции и составной заказ со снимком стоимости/продавца |
+| `payment_events`, `delivery_jobs`, `delivery_attempts`, `supplier_requests` | Входящие события, очередь, попытки и общий бюджет поставщика |
+| `refunds`, `refund_requests`, `delivery_revocations` | Автоматические возвраты, решения администратора, отзыв ключей |
+| `ledger_transactions`, `ledger_entries`, `order_history`, `audit_events` | Проводки, добавляемые снимки, журнал решений |
+| `users`, `auth_sessions`, `cart_items`, `checkouts`, `point_transactions`, `payment_codes` | Аккаунты, роли, сессии, корзина и тестовый баланс |
+| `seller_reviews`, `supplier_incidents`, `order_messages` | Подтверждённые отзывы, доказательства нарушений и приватная переписка |
+
+Миграции 001–005 сохранены. 006 добавляет составные заказы/возвраты/историю/очередь, 007 закрепляет инварианты проводок и выдач, 008 добавляет предложения/отзывы/репутацию, 009 снимает ограничение только на A/B, 010 добавляет роли/баны/переписку/ручные возвраты, 011 — общую границу COMMIT для истории и денег, 012 — сохраняемые платежи СБП/криптой, пополнения и учёт источника средств, 013 — выводы, политика возврата на баланс и явные отметки демо-сценариев, 014 — закупочные стоимости ключей, неизменный снимок при выдаче и представление финансов продавца, 015 — партии, привязку ключей, корзину по партиям и резервирование.
+
+Цена, продавец и состав оплаченной покупки не пересчитываются по текущему каталогу. Подключение магазина блокирует строку пользователя и атомарно добавляет привязку; покупки/сессии не переносятся и не теряются. Корзина и checkout блокируют строки пользователя и предложений, возврат блокирует позицию заказа. Ограничения уникальности и deferred-триггеры PostgreSQL защищают результат независимо от числа worker.
+
+## API
+
+`POST /api/auth/login` или `/register`: `{ "username": "...", "password": "..." }` → `{token,user}`. Приватные маршруты требуют `Authorization: Bearer <token>`. Регистрация дополнительно принимает `role: "buyer" | "seller"` (по умолчанию buyer); для seller обязателен `store_name` длиной 2–100 символов. Произвольную привязку магазина и роль admin публично передать нельзя. Профиль возвращает `can_buy`, `can_sell`, `can_become_seller`; сервер проверяет эти возможности на каждом действии. `role=seller` означает наличие магазина и сохраняет покупательские возможности. Свой магазин нельзя покупать для накрутки отзывов; эта проверка находится на сервере. Логин общий для всех ролей. Чужие покупки/переписка возвращают 404, неподходящая роль — 403, недействительная сессия — 401.
+
+| Метод и путь | Контракт / доступ |
+| --- | --- |
+| `GET /api/catalog?search=&type=&sort=&limit=&offset=` | Публичный каталог; `sort=default/price_asc/price_desc` |
+| `GET /api/catalog/:sku` | Товар, предложения, цены, остатки, рейтинг/флаг, `default_provider` |
+| `GET /api/catalog/:sku/offers` | Все активные предложения незаблокированных продавцов |
+| `GET /api/sellers`, `GET /api/sellers/:provider` | Публичная репутация, подтверждённые отзывы и безопасные доказательства |
+| `POST /api/account/seller` | `{store_name}` — подключить магазин к тому же аккаунту; повтор не создаёт второй магазин, бонус не повторяется |
+| `GET /api/account` | Свой профиль, роль, баланс, последние 100 движений баллов |
+| `GET /api/cart` | Серверная корзина покупателя, суммы, продавцы, `purchasable` |
+| `POST /api/cart/items` | `{sku,quantity?,provider?,offer_id?}`; `offer_id` выбирает точную партию; без него backend выбирает предложение |
+| `PUT /api/cart/items/:sku?offer_id=...` | `{quantity}`; точная строка партии, старый `provider` работает при однозначной строке |
+| `DELETE /api/cart/items/:sku?offer_id=...` | Удаление только выбранной партии |
+| `POST /api/cart/quote` | `{code?,method?:"balance"|"sbp"|"crypto"}` → полная стоимость, применение кода, списание, остаток, `can_checkout`, причина отказа |
+| `POST /api/cart/checkout` | `{checkout_id?,code?,method?:"balance"|"sbp"|"crypto"}` → один составной заказ, позиции, результат списания и серверный прогресс |
+| `GET /api/payment-methods` | Серверные способы оплаты, признак демо и единица валюты |
+| `POST /api/account/topups` | Покупатель: `{payment_id,amount:1..1000000,method:"sbp"|"crypto"}` |
+| `GET /api/account/payments` | Последние 100 собственных платежей |
+| `GET /api/payments/:id` | Собственный платёж, реквизиты, статус, возвраты, `can_confirm`, `can_retry` |
+| `POST /api/payments/:id/simulate` | `{event_id,outcome:"paid"|"failed"|"cancelled"}`; сумма и получатель из БД |
+| `POST /api/payments/:id/retry` | `{retry_id}`; одна новая попытка, прежний заказ и сумма |
+| `GET /api/withdrawal-methods` | Тестовые способы вывода: карта / USDT |
+| `POST /api/account/withdrawals` | `{withdrawal_id,method:"card"|"crypto",amount,recipient}` — резерв на балансе |
+| `GET /api/account/withdrawals`, `GET /api/account/withdrawals/:id` | Собственные заявки и статусы |
+| `POST /api/account/withdrawals/:id/simulate` | `{event_id,outcome:"paid"|"failed"|"cancelled"}` — тестовый исход, без реального перевода |
+| `GET /api/admin/withdrawals` | Последние 200 заявок, карта маскируется |
+| `GET /api/admin/payments` | Последние 200 платежей с покупателями и возвращённой суммой |
+| `GET /api/account/purchases` | Свои позиции и группы заказов |
+| `GET /api/account/purchases/:id` | Карточка, код, продавец, отзыв и разрешение оставить оценку |
+| `POST /api/account/purchases/:id/review` | `{rating:1..5,comment?}`; только завершённая собственная покупка |
+| `GET /api/account/orders/:id` | Свой составной заказ |
+| `POST /api/orders` | Старый `{sku,order_id?}` либо новый `{items:[{sku,quantity?,provider?}],order_id?}` |
+| `GET /api/orders/:id` | Текущее состояние; анонимные API-заказы публичны, пользовательские — только владелец/администратор |
+| `GET /api/orders/:id/history?at=<ISO8601>` | Состояние и суммы на дату с теми же правами |
+| `POST /api/orders/:id/retry` | Безопасное ускорение очередной попытки |
+| `POST /api/orders/:id/simulate-payment` | `{status?,event_id?,created_at?}` — заглушка оплаты анонимных API-заказов; для checkout требуется собственный payment intent |
+| `POST /webhook/payment` | Исходный публичный контракт для API-заказов; пользовательские checkout защищены от обхода payment intent |
+| `GET /api/orders/:id/messages` | Покупатель, продавец этой позиции или администратор; `can_send`, причина закрытия, последние 200 сообщений |
+| `POST /api/orders/:id/messages` | `{id,body}`; повтор с тем же ID/текстом безопасен, после возврата отправка закрыта |
+| `GET /api/seller/dashboard` | Свои товары/статусы/остатки, финансовые итоги, заказы по 50 (`?page=1`), последние 500 ключей |
+| `PUT /api/seller/offers/:sku` | `{price,active}`; совместимый маршрут основной партии своего продавца |
+| `POST /api/seller/lots/split` | `{request_id,source_offer_id,parts:[{name,quantity,price,active?}]}`; атомарное распределение уже загруженных свободных ключей |
+| `PUT /api/seller/lots/:offerId` | `{price,active,name?}`; изменение конкретной своей партии |
+| `PUT /api/seller/inventory/:code/cost` | `{unit_cost:number|null}`; закупочная стоимость только своего ещё невыданного ключа |
+| `GET /api/seller/inventory` | Все свои ключи постранично: `page=1`, `search`, `status=all/available/reserved/issued/revoked`; по 50, цена продажи, статус публикации, `can_edit_price` |
+| `PUT /api/seller/inventory/:code/price` | `{price,active}`; цена продажи и публикация только выбранного свободного ключа, независимо от соседних ключей |
+| `POST /api/seller/inventory` | `{sku,codes:[...],unit_cost?:number|null,offer_id?:string}`; собственный склад, закупка одного ключа, без создания платёжных кодов |
+| `GET /api/admin/orders`, `/users`, `/audit` | Списки для модерации; последние 300/500/200 записей |
+| `POST /api/admin/users/:id/ban` | `{banned,reason}`; отзыв сессий, администраторов блокировать нельзя |
+| `POST /api/admin/sellers/:provider/ban` | `{banned,reason}`; профиль получает флаг, покупки/вход закрываются |
+| `POST /api/admin/orders/:id/refund` | `{reason}` → 202, надёжное задание на отмену/отзыв и возврат |
+| `POST /api/admin/sellers` | `{id,name}` — произвольный ID продавца |
+| `POST /api/admin/seller-accounts` | `{username,password,provider}` — аккаунт с серверной привязкой |
+| `PUT /api/admin/offers/:sku/:provider` | `{price,active?}` |
+| `GET /api/admin/inventory`, `POST /api/admin/inventory` | Склад; добавление `{provider,sku,codes}` сохраняет старую административную возможность создать платёжные коды по цене товара |
+| `GET /api/admin/payment-codes`, `POST /api/admin/payment-codes` | Платёжные коды; `{codes,value_points}` |
+| `GET /api/admin/suppliers`, `PUT /api/admin/suppliers/:provider` | Режим заглушки, задержки, доли сбоев, `requests_per_minute` |
+| `GET /api/admin/summary`, `/queue` | Сводки и прогресс |
+| `GET /api/admin/money?from=&to=` | Остаток на начало, движение, остаток на конец периода `[from,to)` по валюте и счёту |
+| `GET /api/reconciliation`, `POST /api/reconciliation/recover` | Сверка денег/выдач и восстановление заданий |
+| `POST /api/admin/workers/run` | `{limit?}` — ручной проход worker для диагностики |
+| `GET /api/admin/orders/:id/evidence` | Заказ и счётчики подтверждений/проводок |
+
+Все `/api/admin`, `/api/test`, `/api/reconciliation` защищены ролью администратора. Доступ к `/suppliers/:provider/issue` и `/resolve` разрешён worker с заголовком `x-supplier-secret` (`SUPPLIER_SHARED_SECRET`) либо администратору. Заглушки не дают покупателю обойти права и получить чужой ключ напрямую.
+
+## Гарантии и диагностика
+
+Фиксация оплаты, записей ledger и заданий происходит транзакционно. Для внешнего запроса используется устойчивый `request_id`; неоднозначный исход проверяется до выдачи, переключения поставщика или возврата. `resolve` либо подтверждает ранее выданный ключ, либо оставляет отмену под той же блокировкой, что и выдача, запрещая позднюю выдачу отменённого запроса.
+
+Задание хранит фазу, продавца, счётчик исходящих попыток и время следующей попытки. Аренда на 30 секунд ограничивает жизнь worker; номер аренды защищает фиксацию от старого процесса. Восстановление не сбрасывает ожидание лимита. При недоступном реестре заказ остаётся в очереди до восстановления связи.
+
+Двойная запись: оплата — `cash` (СБП/крипта/API) либо `wallet` (баланс/код) / `customer_clearing`; выдача — `customer_clearing` / `sales`; возврат — `customer_clearing` / `wallet` для любого пользовательского заказа, независимо от способа оплаты; для анонимного API-заказа — `cash`. Возврат выданного товара сначала сторнирует `sales`. Дебет/кредит каждой транзакции одной валюты суммируется в ноль; баланс покупателя и журнал возврата фиксируются вместе.
+
+Пополнение: `cash` / `wallet`, демо-бонус и применённый код: `demo_funding` / `wallet`. Старые балансы включены отдельной проводкой `wallet_baseline`. `/api/reconciliation` проверяет также соответствие суммы пользовательских балансов журналу.
+
+Для точной истории PostgreSQL запускается с `track_commit_timestamp=on` (уже в Compose). `business_operations`, `history_operations`, `ledger_operations`, `group_operations` связывают факты одной транзакции, `operation_commits` сохраняет фактический COMMIT. Recovery подбирает timestamps после аварии до архивирования. PostgreSQL ограничивает срок хранения собственных timestamps, поэтому нужен отдельный постоянный архив: [документация PostgreSQL](https://www.postgresql.org/docs/17/functions-info.html#FUNCTIONS-COMMIT-TIMESTAMP). Для старых операций до миграции граница реконструирована из сохранившихся фактов и явно обозначена `legacy_reconstructed`; новые — `commit_time`. Исторический запрос принимает ISO8601 с микросекундами, граница включительна для заказа и исключительна для конца денежного периода.
+
+Платёжные реквизиты и окончательные состояния защищены ограничениями БД; события только добавляются. Истечение срока обрабатывается recovery. Оплата, выдача и возврат не зависят от открытой вкладки браузера. Публичный webhook не может оплатить пользовательский заказ в обход его способа оплаты.
+
+История и репутация отражают проверяемые факты тестового реестра, не субъективный вывод о человеке. Рейтинг сам по себе не даёт красный флаг. Административный возврат не считается автоматически доказательством обмана.
+
+Логи JSON содержат идентификаторы заказов, событий и попыток. Для ошибок запуска: `docker compose logs --tail=100 backend`; для проверки состояния: `docker compose ps` и `/health`. Рабочую БД не следует очищать для запуска тестов — для этого есть отдельный Compose profile.
+
+
+Выводы хранятся в `withdrawals`, события — в добавляемой `withdrawal_events`. Создание списывает доступный баланс в резерв и проводит `wallet / withdrawal_clearing`; успех — `withdrawal_clearing / cash`; отказ/отмена/истечение — `withdrawal_clearing / wallet` с восстановлением баланса. Повторы и параллельные заявки защищены транзакциями и уникальными ID. Для карты сохраняются только последние четыре цифры и отпечаток для проверки идемпотентности; полный номер в БД не хранится. Криптовалютный расчёт USDT делает сервер по демонстрационному курсу.
+
+Все возвраты пользовательских покупок зачисляются в wallet. Прежние внешние возвраты перенесены отдельными фактами `refund_wallet_transfers`, денежными и балансовыми проводками. Первоначальные `refunds` не переписываются. `/api/reconciliation` продолжает проверять весь доступный баланс против ledger.
+
+## Финансы и товары продавца
+
+`GET /api/seller/dashboard?page=1` отдаёт `offers` с `is_mine`, `listing_status/listing_label`, остатком, количеством проданных ключей и суммами. Признак принадлежности включает своё предложение или склад, даже если товар ещё не опубликован. В `products_summary` — товары и доступные ключи. `orders` содержит цену на момент покупки, покупателя, возврат, `net_income`, закупку и `profit`; `pagination` открывает все заказы. `summary` охватывает все страницы.
+
+Источник денежных итогов — PostgreSQL view `seller_order_financials`, связанная с исходными заказами, фактами возврата и проводками `sales`. Цена текущего предложения не меняет старую продажу. Заказ до выдачи не приносит дохода. Возврат выданного товара сторнирует доход один раз. Комиссия площадки в данной модели — 0.
+
+Закупка сохраняется в `provider_inventory.unit_cost_minor`, при выдаче триггер фиксирует её в защищённой от изменений `deliveries`. API и триггер запрещают менять закупку уже занятого ключа; чужой ключ недоступен. `NULL` означает неизвестную закупку, `0` — бесплатный ключ. Для старых выдач неизвестная себестоимость не заменяется нулём: `profit=null`, `unknown_cost_count>0`. Прибыль = доход после возвратов − закупка выданных ключей; отозванный ключ остаётся расходом, поэтому возможен убыток. Налоги и сторонние расходы не моделируются. Этот отчёт не означает перечисление выручки на личный кошелёк продавца.
+
+Предложения, заказы, склад и денежные итоги читаются одним SQL-снимком. Frontend фильтрует предоставленный список, форматирует суммы и сохраняет ввод формы между автоматическими обновлениями; финансовых расчётов в браузере нет.
+
+## Партии и резервы
+
+Для прямого редактирования ключа `updateKeyPrice` использует ту же `seller_offers`: если предложение общее, выбранный ключ транзакционно получает отдельное предложение без изменения других ключей. Собственное предложение с одним ключом обновляется на месте; повтор идентичного PUT не создаёт дубликаты. Основная партия остаётся совместимой со старым API. Порядок блокировок совпадает с оформлением и разделением партий; резерв, выдача и отзыв запрещают изменение. Добавление других ключей в ранее индивидуальное предложение также учитывается: следующая правка снова отделит только выбранный ключ. Публичное имя предложения не содержит секретный код. Дополнительной схемы цен или вычислений цены на frontend нет.
+
+Таблица `seller_offers` расширена, отдельной конкурирующей таблицы цен нет: первичный ключ `id`, имя партии и `is_default`; частичный уникальный индекс сохраняет одну основную партию на `(sku,provider)`. Существующие ключи и строки корзины мигрируют в основную партию без изменения цен, кодов и фактов выдач. Seed добавляет только отсутствующие основные партии и ключи, пользовательские партии сохраняются при перезапуске.
+
+`provider_inventory.offer_id` связан составным FK с SKU и продавцом партии. `reserved_order_id` уникален и связан с выбранной партией заказа. `orders.assigned_offer_id/offer_name` фиксируются при создании; триггер запрещает их переписывание. Старые завершённые заказы сохраняются без ретроспективной подстановки партии; для ещё открытых покупательских заказов миграция дополняет историю привязкой к исходной основной партии и резервирует доступный ключ.
+
+Распределение блокирует исходную партию и свободные ключи. При нехватке вся операция откатывается. `(provider,request_id)` и неизменяемая таблица `seller_lot_operations` защищают повторы; другой payload с тем же ID получает 409. Зарезервированные, выданные и отозванные ключи исключены. Закупочная стоимость занятых ключей также защищена.
+
+Оформление корзины резервирует конкретные ключи до фиксации списания/платежа; конкурентный проигравший получает 409 без списания. СБП/USDT сохраняют резерв на срок платежа (15 минут). Отказ, отмена и истечение освобождают его транзакционно. Retry сначала заново резервирует ту же партию, затем создаёт платёж с неизменной суммой; при нехватке ключей деньги не списываются и соседняя партия не подставляется. Смена цены или выключение предложения не меняет уже оформленные заказы.
+
+Stub выбирает ключ из закреплённой партии, учитывая резерв своего заказа. Независимая проверка и триггер выдачи запрещают чужую партию даже при совпадении SKU/продавца. Старый одиночный API с fallback A/B использует только основные партии; произвольно взять дорогой ключ из пользовательской партии он не может. Его прежние конечные возвраты при недоступности сохранены.
+
+Продавец получает `offer_id/offer_name/is_default`, свободный остаток и резерв каждой партии, её продажи/доход/прибыль; `products_summary.total` считает уникальные SKU, `lots` — партии. Админский склад отделяет резервы от свободного остатка. Финансовые итоги всех партий складываются без повторного учёта.
